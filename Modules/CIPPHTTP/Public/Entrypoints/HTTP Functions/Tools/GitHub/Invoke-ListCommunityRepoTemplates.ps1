@@ -9,7 +9,7 @@ function Invoke-ListCommunityRepoTemplates {
     .FUNCTIONALITY
         Entrypoint,AnyTenant
     .ROLE
-        CIPP.Core.Read
+        CIPP.TemplateLibrary.Read
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -21,7 +21,9 @@ function Invoke-ListCommunityRepoTemplates {
             if (!$Branch) { $Branch = 'main' }
             $File = Get-GitHubFileContents -FullName $Request.Query.FullName -Path $Request.Query.Path -Branch $Branch
             $Body = @{ Results = $File }
+            $StatusCode = [HttpStatusCode]::OK
         } catch {
+            $StatusCode = [HttpStatusCode]::InternalServerError
             $Body = @{
                 Results = @(@{
                         resultText = "Unable to retrieve file contents: $($_.Exception.Message)"
@@ -30,7 +32,7 @@ function Invoke-ListCommunityRepoTemplates {
             }
         }
         return ([HttpResponseContext]@{
-                StatusCode = [HttpStatusCode]::OK
+                StatusCode = $StatusCode
                 Body       = $Body
             })
     }
@@ -58,37 +60,50 @@ function Invoke-ListCommunityRepoTemplates {
     # Community-imported template rows carry Source (repo FullName) and SHA (git blob sha),
     # which lets us mark imported/update-available without any extra GitHub calls.
     $TemplatesTable = Get-CippTable -tablename 'templates'
-    $ImportedTemplates = foreach ($Row in (Get-CIPPAzDataTableEntity @TemplatesTable)) {
-        if ([string]::IsNullOrEmpty($Row.Source)) { continue }
-        $Name = $null
-        try {
-            $Data = $Row.JSON | ConvertFrom-Json -Depth 100 -ErrorAction Stop
-            $Name = $Data.displayName ?? $Data.Displayname ?? $Data.templateName ?? $Data.name
-        } catch {
-            # Name matching is best-effort; SHA matching still works without it
-        }
-        [PSCustomObject]@{
-            Source        = $Row.Source
-            SHA           = $Row.SHA
-            SanitizedName = if ($Name) { ($Name -replace '\s', '_' -replace '[^\w\d_]', '') } else { $null }
-        }
-    }
+    $ImportedTemplates = @(foreach ($Row in (Get-CIPPAzDataTableEntity @TemplatesTable)) {
+            if ([string]::IsNullOrEmpty($Row.Source)) { continue }
+            $Name = $null
+            try {
+                $Data = $Row.JSON | ConvertFrom-Json -Depth 100 -ErrorAction Stop
+                $Name = $Data.displayName ?? $Data.Displayname ?? $Data.templateName ?? $Data.name
+            } catch {
+                # Name matching is best-effort; SHA matching still works without it
+            }
+            [PSCustomObject]@{
+                Source        = $Row.Source
+                SHA           = $Row.SHA
+                SanitizedName = if ($Name) { ($Name -replace '\s', '_' -replace '[^\w\d_]', '') } else { $null }
+            }
+        })
+    # Imported baselines live on BaselineRollouts, not the templates table - join them the
+    # same way so BaselineTemplate catalog items get Imported/UpdateAvailable badges.
+    $RolloutTable = Get-CippTable -tablename 'BaselineRollouts'
+    $ImportedTemplates = $ImportedTemplates + @(foreach ($Row in (Get-CIPPAzDataTableEntity @RolloutTable -Filter "PartitionKey eq 'rollout'")) {
+            if ([string]::IsNullOrEmpty($Row.Source)) { continue }
+            [PSCustomObject]@{
+                Source        = $Row.Source
+                SHA           = $Row.SHA
+                SanitizedName = if ($Row.templateName) { ("$($Row.templateName)" -replace '\s', '_' -replace '[^\w\d_]', '') } else { $null }
+            }
+        })
 
     # Folder names in CIPP-native repos are templates-table PartitionKeys ("Save to GitHub"
     # writes {PartitionKey}/{Name}.json), so these folder names reliably identify the type.
     $KnownPartitionKeys = @(
         'IntuneTemplate', 'CATemplate', 'StandardsTemplate', 'StandardsTemplateV2', 'GroupTemplate',
-        'AppApprovalTemplate', 'ReportBuilderTemplate', 'BPATemplate', 'TransportTemplate',
+        'AppApprovalTemplate', 'ReportBuilderTemplate', 'TransportTemplate',
         'ExConnectorTemplate', 'AppTemplate', 'ContactTemplate', 'JITAdminTemplate',
         'UserDefaultTemplate', 'AssignmentFilterTemplate', 'IntuneReusableSettingTemplate',
         'SharePointTemplate', 'DlpCompliancePolicyTemplate', 'RetentionCompliancePolicyTemplate',
-        'SensitivityLabelTemplate', 'SensitiveInfoTypeTemplate'
+        'SensitivityLabelTemplate', 'SensitiveInfoTypeTemplate', 'BaselineTemplate',
+        'PIMRoleSettingsTemplate'
     )
 
     $Warnings = [System.Collections.Generic.List[string]]::new()
     $CatalogItems = [System.Collections.Generic.List[object]]::new()
     $RepoMetadata = [System.Collections.Generic.List[object]]::new()
 
+    $Failed = 0
     foreach ($Repo in $Repos) {
         $Branch = $Repo.DefaultBranch
         if ([string]::IsNullOrEmpty($Branch)) { $Branch = 'main' }
@@ -176,6 +191,7 @@ function Invoke-ListCommunityRepoTemplates {
                     })
             }
         } catch {
+            $Failed++
             $Warnings.Add("Unable to list templates for $($Repo.FullName): $($_.Exception.Message)")
         }
     }
@@ -189,7 +205,7 @@ function Invoke-ListCommunityRepoTemplates {
     }
 
     return ([HttpResponseContext]@{
-            StatusCode = [HttpStatusCode]::OK
+            StatusCode = Get-CippBulkStatusCode -Total @($Repos).Count -Failed $Failed
             Body       = $Body
         })
 }

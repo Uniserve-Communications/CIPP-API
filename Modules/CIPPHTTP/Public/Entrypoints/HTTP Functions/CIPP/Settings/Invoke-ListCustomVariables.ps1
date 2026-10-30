@@ -63,6 +63,20 @@ function Invoke-ListCustomVariables {
                 Category    = 'tenant'
             },
             @{
+                Name        = 'globaladminsid'
+                Variable    = '%globaladminsid%'
+                Description = 'The tenant Global Administrator role SID, from the cached directory roles'
+                Type        = 'reserved'
+                Category    = 'tenant'
+            },
+            @{
+                Name        = 'deviceadminsid'
+                Variable    = '%deviceadminsid%'
+                Description = 'The tenant Microsoft Entra Joined Device Local Administrator role SID, from the cached directory roles'
+                Type        = 'reserved'
+                Category    = 'tenant'
+            },
+            @{
                 Name        = 'partnertenantid'
                 Variable    = '%partnertenantid%'
                 Description = 'The partner tenant ID'
@@ -272,14 +286,23 @@ function Invoke-ListCustomVariables {
                     }
                 }
 
+                # Resolved through Get-CIPPTextReplacement so there is one definition of what each
+                # token means. System tokens are skipped: they are expanded on the endpoint, not here.
+                # Role SIDs throw when uncached, so they resolve one at a time and cannot block the rest.
+                $RoleSidVariables = @($VariableMap.Values | Where-Object { $_.Type -eq 'reserved' -and $_.Variable -match '^%(globaladmin|deviceadmin)sid%$' })
+                foreach ($Variable in $RoleSidVariables) {
+                    try { $Variable.Value = Get-CIPPTextReplacement -TenantFilter $TenantFilter -Text $Variable.Variable } catch { Write-Information $_.Exception.Message }
+                }
                 $Resolvable = @($VariableMap.Values | Where-Object {
-                        $_.Type -eq 'reserved' -and $_.Category -ne 'system'
+                        $_.Type -eq 'reserved' -and $_.Category -ne 'system' -and $_ -notin $RoleSidVariables
                     })
                 if ($Resolvable.Count -gt 0) {
+                    # Joined into one call by a separator no domain, GUID or URL can contain.
                     $Separator = '<<|CIPPVAR|>>'
                     $Tokens = @($Resolvable | ForEach-Object { $_.Variable })
                     $Resolved = @((Get-CIPPTextReplacement -TenantFilter $TenantFilter -Text ($Tokens -join $Separator)) -split ([regex]::Escape($Separator)))
 
+                    # A mismatch would misalign every value after it, so none are used.
                     if ($Resolved.Count -eq $Tokens.Count) {
                         for ($i = 0; $i -lt $Tokens.Count; $i++) {
                             if ($Resolved[$i] -ne $Tokens[$i]) {
